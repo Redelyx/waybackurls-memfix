@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -59,62 +58,86 @@ func main() {
 		return
 	}
 
-	fetchFns := []fetchFn{
-		getWaybackURLs,
-		getCommonCrawlURLs,
-		getVirusTotalURLs,
-	}
-
 	for _, domain := range domains {
 
 		var wg sync.WaitGroup
-		wurls := make(chan wurl)
+		wurls := make(chan wurl, 1000) // Buffered channel to prevent blocking
+		seen := make(map[string]bool)
+		var seenMutex sync.Mutex
 
-		for _, fn := range fetchFns {
-			wg.Add(1)
-			fetch := fn
-			go func() {
-				defer wg.Done()
-				resp, err := fetch(domain, noSubs)
-				if err != nil {
-					return
+		// Start goroutine to handle output
+		outputDone := make(chan bool)
+		go func() {
+			for w := range wurls {
+				seenMutex.Lock()
+				if seen[w.url] {
+					seenMutex.Unlock()
+					continue
 				}
-				for _, r := range resp {
-					if noSubs && isSubdomain(r.url, domain) {
-						continue
+				seen[w.url] = true
+				seenMutex.Unlock()
+
+				if dates && w.date != "" {
+					d, err := time.Parse("20060102150405", w.date)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "failed to parse date [%s] for URL [%s]\n", w.date, w.url)
+						fmt.Println(w.url)
+					} else {
+						fmt.Printf("%s %s\n", d.Format(time.RFC3339), w.url)
 					}
-					wurls <- r
+				} else {
+					fmt.Println(w.url)
 				}
-			}()
-		}
+			}
+			outputDone <- true
+		}()
 
+		// Start fetch functions
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			getWaybackURLsStreaming(domain, noSubs, wurls)
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := getCommonCrawlURLs(domain, noSubs)
+			if err != nil {
+				return
+			}
+			for _, r := range resp {
+				if noSubs && isSubdomain(r.url, domain) {
+					continue
+				}
+				wurls <- r
+			}
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := getVirusTotalURLs(domain, noSubs)
+			if err != nil {
+				return
+			}
+			for _, r := range resp {
+				if noSubs && isSubdomain(r.url, domain) {
+					continue
+				}
+				wurls <- r
+			}
+		}()
+
+		// Wait for all fetchers to complete, then close channel
 		go func() {
 			wg.Wait()
 			close(wurls)
 		}()
 
-		seen := make(map[string]bool)
-		for w := range wurls {
-			if _, ok := seen[w.url]; ok {
-				continue
-			}
-			seen[w.url] = true
-
-			if dates {
-
-				d, err := time.Parse("20060102150405", w.date)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "failed to parse date [%s] for URL [%s]\n", w.date, w.url)
-				}
-
-				fmt.Printf("%s %s\n", d.Format(time.RFC3339), w.url)
-
-			} else {
-				fmt.Println(w.url)
-			}
-		}
+		// Wait for output to complete
+		<-outputDone
 	}
-
 }
 
 type wurl struct {
@@ -124,44 +147,45 @@ type wurl struct {
 
 type fetchFn func(string, bool) ([]wurl, error)
 
-func getWaybackURLs(domain string, noSubs bool) ([]wurl, error) {
+// New streaming version of getWaybackURLs
+func getWaybackURLsStreaming(domain string, noSubs bool, output chan<- wurl) {
 	subsWildcard := "*."
 	if noSubs {
 		subsWildcard = ""
 	}
 
 	res, err := http.Get(
-		fmt.Sprintf("http://web.archive.org/cdx/search/cdx?url=%s%s/*&output=json&collapse=urlkey", subsWildcard, domain),
+		fmt.Sprintf("http://web.archive.org/cdx/search/cdx?url=%s%s/*&output=plain&collapse=urlkey", subsWildcard, domain),
 	)
 	if err != nil {
-		return []wurl{}, err
+		return
 	}
+	defer res.Body.Close()
 
-	raw, err := ioutil.ReadAll(res.Body)
-
-	res.Body.Close()
-	if err != nil {
-		return []wurl{}, err
-	}
-
-	var wrapper [][]string
-	err = json.Unmarshal(raw, &wrapper)
-
-	out := make([]wurl, 0, len(wrapper))
-
-	skip := true
-	for _, urls := range wrapper {
-		// The first item is always just the string "original",
-		// so we should skip the first item
-		if skip {
-			skip = false
+	sc := bufio.NewScanner(res.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
 			continue
 		}
-		out = append(out, wurl{date: urls[1], url: urls[2]})
+
+		// Plain format: urlkey timestamp original mimetype statuscode digest length
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			w := wurl{date: fields[1], url: fields[2]}
+			
+			// Check subdomain filter here to avoid sending unnecessary data
+			if noSubs && isSubdomain(w.url, domain) {
+				continue
+			}
+			
+			select {
+			case output <- w:
+			default:
+				// Channel is full, skip this URL to prevent blocking
+			}
+		}
 	}
-
-	return out, nil
-
 }
 
 func getCommonCrawlURLs(domain string, noSubs bool) ([]wurl, error) {
